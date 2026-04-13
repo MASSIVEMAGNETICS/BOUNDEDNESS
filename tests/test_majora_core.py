@@ -453,3 +453,284 @@ class TestMajoraCoreStatesProperty:
     def test_states_property_matches_graph(self):
         core = MajoraCore(n_nodes=100)
         assert core.STATES == SIRGraph.STATES
+
+
+# ---------------------------------------------------------------------------
+# CanonPreferences — additional edge cases
+# ---------------------------------------------------------------------------
+
+class TestCanonPreferencesEdgeCases:
+    def test_mutation_is_reflected(self):
+        prefs = CanonPreferences()
+        prefs.mortality_urgency_weight = 0.55
+        assert prefs.to_dict()["mortality_urgency_weight"] == pytest.approx(0.55)
+
+    def test_all_fields_are_floats(self):
+        prefs = CanonPreferences()
+        for v in prefs.to_dict().values():
+            assert isinstance(v, float)
+
+    def test_zero_adaptation_rate_does_not_update_weights(self):
+        """With adaptation_rate=0, weights should not change in auto_tune_priors."""
+        layer = ActiveInferenceLayer(CanonPreferences(adaptation_rate=0.0))
+        before = layer.prefs.to_dict()
+        layer.auto_tune_priors({"urgency_impact": 0.9, "rust_belt_conversion": 0.7, "convergence_achieved": 0.8})
+        after = layer.prefs.to_dict()
+        # Weights clamped but not shifted when lr=0
+        for key in ("mortality_urgency_weight", "lorain_roots_geo_weight", "builder_proof_of_work_weight"):
+            assert after[key] == pytest.approx(before[key])
+
+
+# ---------------------------------------------------------------------------
+# ActiveInferenceLayer — edge cases
+# ---------------------------------------------------------------------------
+
+class TestActiveInferenceLayerEdgeCases:
+    def test_empty_sim_results_raises_or_handles(self):
+        """score_protocol with one element should not raise."""
+        layer = ActiveInferenceLayer()
+        result = layer.score_protocol([{
+            "streams": 100,
+            "virality": 0.5,
+            "rust_belt_share": 0.3,
+            "urgency_score": 0.6,
+            "convergence_score": 0.7,
+            "streams_bucket": np.array([0.6, 0.25, 0.15]),
+        }])
+        assert result["efe_score"] == min(result["all_efes"])
+
+    def test_compute_efe_all_zero_outcomes(self):
+        layer = ActiveInferenceLayer()
+        outcomes = {
+            "urgency_score": 0.0,
+            "rust_belt_share": 0.0,
+            "convergence_score": 0.0,
+            "virality": 0.0,
+        }
+        efe = layer.compute_efe(outcomes, {})
+        assert isinstance(efe, float)
+
+    def test_score_protocol_std_efe_non_negative(self):
+        layer = ActiveInferenceLayer()
+        results = [
+            {
+                "streams": 500,
+                "virality": float(np.random.uniform(0.2, 0.8)),
+                "rust_belt_share": 0.4,
+                "urgency_score": 0.6,
+                "convergence_score": 0.7,
+                "streams_bucket": np.array([0.6, 0.25, 0.15]),
+            }
+            for _ in range(10)
+        ]
+        scored = layer.score_protocol(results)
+        assert scored["std_efe"] >= 0.0
+
+    def test_auto_tune_priors_clamps_upper_bound(self):
+        """A very high learning rate should not push weights above their bounds."""
+        layer = ActiveInferenceLayer(CanonPreferences(mortality_urgency_weight=0.59))
+        layer.auto_tune_priors({"urgency_impact": 0.0}, learning_rate=10.0)
+        assert layer.prefs.mortality_urgency_weight <= 0.6
+
+    def test_auto_tune_priors_clamps_lower_bound(self):
+        """A very negative gradient should not push weights below their bounds."""
+        layer = ActiveInferenceLayer(CanonPreferences(lorain_roots_geo_weight=0.11))
+        layer.auto_tune_priors({"rust_belt_conversion": 1.0}, learning_rate=10.0)
+        assert layer.prefs.lorain_roots_geo_weight >= 0.1
+
+    def test_historical_convergence_never_negative(self):
+        layer = ActiveInferenceLayer()
+        layer.auto_tune_priors({"convergence_achieved": 0.0})
+        assert layer.prefs.historical_convergence_score >= 0.0
+
+    def test_score_protocol_best_efe_leq_all_others(self):
+        layer = ActiveInferenceLayer()
+        results = [
+            {
+                "streams": i * 100,
+                "virality": 0.1 * i,
+                "rust_belt_share": 0.3,
+                "urgency_score": 0.5,
+                "convergence_score": 0.6,
+                "streams_bucket": np.array([0.6, 0.25, 0.15]),
+            }
+            for i in range(1, 8)
+        ]
+        scored = layer.score_protocol(results)
+        for efe in scored["all_efes"]:
+            assert scored["efe_score"] <= efe
+
+
+# ---------------------------------------------------------------------------
+# SIRGraph — additional edge cases
+# ---------------------------------------------------------------------------
+
+class TestSIRGraphEdgeCases:
+    def test_different_seeds_produce_different_graphs(self):
+        g1 = SIRGraph(n_nodes=100, seed=1)
+        g2 = SIRGraph(n_nodes=100, seed=2)
+        assert not np.array_equal(g1.adj_matrix, g2.adj_matrix)
+
+    def test_initialize_states_repeated_call_resets(self):
+        graph = SIRGraph(n_nodes=200, seed=3)
+        graph.initialize_states(seed_fraction=0.5)
+        infected_first = int(np.sum(graph.states == 2))
+        graph.initialize_states(seed_fraction=0.02)
+        infected_second = int(np.sum(graph.states == 2))
+        assert infected_first != infected_second
+
+    def test_state_dtype_is_int8(self):
+        graph = SIRGraph(n_nodes=100, seed=0)
+        graph.initialize_states()
+        assert graph.states.dtype == np.int8
+
+    def test_all_nodes_susceptible_after_zero_seed_fraction(self):
+        graph = SIRGraph(n_nodes=200, seed=5)
+        graph.initialize_states(seed_fraction=0.0)
+        assert np.all(graph.states == 0)
+
+    def test_theme_resonance_in_zero_one_range(self):
+        graph = SIRGraph(n_nodes=500, seed=9)
+        assert float(graph.theme_resonance.min()) >= 0.0
+        assert float(graph.theme_resonance.max()) <= 1.0
+
+    def test_lorain_boost_reflected_in_geo_boost(self):
+        graph = SIRGraph(n_nodes=100, seed=1, lorain_boost=2.5)
+        rust_nodes = graph.geo == 1.0
+        assert np.all(graph.geo_boost[rust_nodes] == pytest.approx(2.5))
+
+    def test_build_graph_is_idempotent(self):
+        graph = SIRGraph(n_nodes=100, seed=7)
+        adj1 = graph.adj_matrix.copy()
+        graph.build_graph()
+        np.testing.assert_array_equal(graph.adj_matrix, adj1)
+
+    def test_step_with_high_beta_increases_non_susceptible(self):
+        graph = SIRGraph(n_nodes=300, seed=42)
+        graph.initialize_states(seed_fraction=0.05)
+        s_before = int(np.sum(graph.states == 0))
+        for _ in range(5):
+            graph.step(beta=0.5, gamma=0.5, delta=0.0)
+        s_after = int(np.sum(graph.states == 0))
+        assert s_after < s_before
+
+
+# ---------------------------------------------------------------------------
+# sir_step_numba — additional edge cases
+# ---------------------------------------------------------------------------
+
+class TestSirStepNumbaEdgeCases:
+    def _setup(self, n: int, n_infected: int = 5, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        adj = (rng.random((n, n)) > 0.88).astype(np.float64)
+        theme = rng.beta(2, 5, n).astype(np.float64)
+        geo = np.ones(n, dtype=np.float64)
+        states = np.zeros(n, dtype=np.int8)
+        states[:n_infected] = 2
+        return states, adj, theme, geo
+
+    def test_no_spread_with_zero_beta(self):
+        n = 60
+        states, adj, theme, geo = self._setup(n)
+        initial_infected = int(np.sum(states == 2))
+        result = sir_step_numba(states, adj, 0.0, 0.0, 0.0, theme, geo, 0.0, n, 1)
+        # With zero rates no S node can become E
+        newly_exposed = int(np.sum((states == 0) & (result == 1)))
+        assert newly_exposed == 0
+
+    def test_all_e_convert_with_gamma_one(self):
+        n = 40
+        states = np.full(n, 1, dtype=np.int8)  # all E
+        adj = np.zeros((n, n), dtype=np.float64)
+        theme = np.zeros(n, dtype=np.float64)
+        geo = np.ones(n, dtype=np.float64)
+        result = sir_step_numba(states, adj, 0.0, 1.0, 0.0, theme, geo, 0.0, n, 2)
+        assert np.all(result == 2)
+
+    def test_deterministic_with_same_seed(self):
+        n = 50
+        states, adj, theme, geo = self._setup(n, seed=77)
+        r1 = sir_step_numba(states, adj, 0.08, 0.15, 0.02, theme, geo, 0.0, n, 42)
+        r2 = sir_step_numba(states, adj, 0.08, 0.15, 0.02, theme, geo, 0.0, n, 42)
+        np.testing.assert_array_equal(r1, r2)
+
+
+# ---------------------------------------------------------------------------
+# MajoraCore — additional edge cases
+# ---------------------------------------------------------------------------
+
+class TestMajoraCoreEdgeCases:
+    def test_content_hash_bytes_input(self):
+        core = MajoraCore(n_nodes=100)
+        h = core._content_hash(b"raw bytes")
+        assert isinstance(h, str)
+        assert len(h) == 16
+
+    def test_cache_key_combines_hash_and_preset(self):
+        core = MajoraCore(n_nodes=100)
+        key = core._cache_key("abc123", "album")
+        assert key == "abc123_album"
+
+    def test_same_content_different_presets_different_cache_keys(self):
+        core = MajoraCore(n_nodes=100)
+        k1 = core._cache_key("abc", "music_single")
+        k2 = core._cache_key("abc", "album")
+        assert k1 != k2
+
+    def test_run_monte_carlo_single_sim(self):
+        core = MajoraCore(n_nodes=100)
+        result = core.run_monte_carlo("single_sim", n_sims=1)
+        assert result["n_sims_run"] == 1
+        assert isinstance(result["efe_score"], float)
+
+    def test_run_monte_carlo_efe_std_non_negative(self):
+        core = MajoraCore(n_nodes=200)
+        result = core.run_monte_carlo("std_test", n_sims=10)
+        assert result["efe_std"] >= 0.0
+
+    def test_run_monte_carlo_with_explicit_seeds(self):
+        core = MajoraCore(n_nodes=200)
+        seeds = list(range(10))
+        result = core.run_monte_carlo("seeded", n_sims=10, timeline_seeds=seeds)
+        assert result["n_sims_run"] == 10
+
+    def test_canon_aligned_metrics_dict_has_four_keys(self):
+        core = MajoraCore(n_nodes=150)
+        result = core.run_monte_carlo("metric_check", n_sims=5)
+        metrics = result["canon_aligned_metrics"]
+        expected_keys = {"urgency_score", "rust_belt_share", "convergence_score", "virality"}
+        assert set(metrics.keys()) == expected_keys
+
+    def test_winning_drop_time_is_string(self):
+        core = MajoraCore(n_nodes=100)
+        result = core.run_monte_carlo("drop_time", n_sims=3)
+        assert isinstance(result["winning_drop_time"], str)
+
+    def test_background_does_not_run_without_history(self):
+        """Background thread should sleep without calling auto_tune if history is empty."""
+        core = MajoraCore(n_nodes=100)
+        assert len(core.ai_layer.history) == 0
+        core.start_background_majora(interval_seconds=9999)
+        import time as _time
+        _time.sleep(0.05)  # Let thread tick once
+        core.stop_background()
+        # No history was added because the thread saw an empty history list
+        assert len(core.ai_layer.history) == 0
+
+    def test_efe_score_is_finite(self):
+        core = MajoraCore(n_nodes=150)
+        result = core.run_monte_carlo("finite_efe", n_sims=5)
+        assert np.isfinite(result["efe_score"])
+
+    def test_cache_grows_up_to_max(self):
+        core = MajoraCore(n_nodes=100, cache_size=3)
+        for i in range(3):
+            core.run_monte_carlo(f"unique_{i}", n_sims=2)
+        assert len(core.cache) == 3
+
+    def test_states_property_returns_correct_dict(self):
+        core = MajoraCore(n_nodes=100)
+        s = core.STATES
+        assert set(s.keys()) == {"S", "E", "I", "A", "F"}
+        assert all(isinstance(v, int) for v in s.values())
+
